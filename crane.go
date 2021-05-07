@@ -85,11 +85,17 @@ func main() {
 	}
 
 	for _, pvc := range nsPVCList.Items {
-		var transfer state_transfer.transfer
-		transfer = state_transfer.CreateRsynctransfer()
+		var transfer state_transfer.Transfer
+
+		transfer = state_transfer.CreateRcloneTransfer()
+		//transfer = state_transfer.CreateRsyncTransfer()
+
 		transfer.SetTransport(&state_transfer.StunnelTransport{})
-		//transfer.SetEndpoint(&state_transfer.RouteEndpoint{})
-		transfer.SetEndpoint(&state_transfer.LoadBalancerEndpoint{})
+		//transfer.SetTransport(&state_transfer.NullTransport{})
+
+		transfer.SetEndpoint(&state_transfer.RouteEndpoint{})
+		//transfer.SetEndpoint(&state_transfer.LoadBalancerEndpoint{})
+
 		transfer.SetSource(srccfg)
 		transfer.SetDestination(dstcfg)
 		transfer.SetPVC(pvc)
