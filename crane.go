@@ -2,112 +2,156 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"log"
 	"os"
+	"time"
 
-	"github.com/jmontleon/crane-lib/state_transfer"
-	projectv1 "github.com/openshift/api/project/v1"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/konveyor/crane-lib/state_transfer"
+	"github.com/konveyor/crane-lib/state_transfer/endpoint"
+	"github.com/konveyor/crane-lib/state_transfer/endpoint/route"
+	"github.com/konveyor/crane-lib/state_transfer/labels"
+	"github.com/konveyor/crane-lib/state_transfer/transfer"
+	"github.com/konveyor/crane-lib/state_transfer/transfer/rclone"
+	"github.com/konveyor/crane-lib/state_transfer/transport"
+	"github.com/konveyor/crane-lib/state_transfer/transport/stunnel"
+	routev1 "github.com/openshift/api/route/v1"
+	v1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
-const ns = "robot-shop"
+var (
+	srcCfg       = &rest.Config{}
+	destCfg      = &rest.Config{}
+	srcNamespace = "robot-shop"
+	srcPVC       = "mysql-data-volume-claim"
+)
 
+// This example shows how to wire up the components of the lib to
+// transfer data from one PVC to another
 func main() {
-
-	dstcfg, err := config.GetConfig()
-	dstcfg.Burst = 1000
-	dstcfg.QPS = 1000
+	destCfg, err := config.GetConfig()
+	destCfg.Burst = 1000
+	destCfg.QPS = 1000
 	oldKubeConfigEnv := os.Getenv("KUBECONFIG")
-	os.Setenv("KUBECONFIG", os.Getenv("HOME")+"/.kube-src/config")
-	srccfg, err := config.GetConfig()
-	srccfg.Burst = 1000
-	srccfg.QPS = 1000
+	os.Setenv("KUBECONFIG", os.Getenv("HOME")+"/.kube/config")
+	srcCfg, err := config.GetConfig()
+	srcCfg.Burst = 1000
+	srcCfg.QPS = 1000
 	os.Setenv("KUBECONFIG", oldKubeConfigEnv)
 
 	scheme := runtime.NewScheme()
-	if err := projectv1.AddToScheme(scheme); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+	if err := routev1.AddToScheme(scheme); err != nil {
+		log.Fatal(err, "unable to add routev1 scheme")
 	}
-	c, err := client.New(srccfg, client.Options{Scheme: scheme})
+	if err := v1.AddToScheme(scheme); err != nil {
+		log.Fatal(err, "unable to add v1 scheme")
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+
+		log.Fatal(err, "unable to add corev1 scheme")
+	}
+
+	srcClient, err := client.New(srcCfg, client.Options{Scheme: scheme})
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		log.Fatal(err, "unable to create source client")
 	}
 
-	project := projectv1.Project{}
-	err = c.Get(context.TODO(), types.NamespacedName{Name: ns, Namespace: ns}, &project)
+	destClient, err := client.New(destCfg, client.Options{Scheme: scheme})
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		log.Fatal(err, "unable to create destination client")
 	}
-	project.ResourceVersion = ""
 
-	dc, err := client.New(dstcfg, client.Options{Scheme: scheme})
+	// quiesce the applications if needed on the source side
+	err = state_transfer.QuiesceApplications(srcCfg, srcNamespace)
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		log.Fatal(err, "unable to quiesce application on source cluster")
 	}
 
-	err = dc.Create(context.TODO(), &project, &client.CreateOptions{})
+	// set up the PVC on destination to receive the data
+	pvc := &corev1.PersistentVolumeClaim{}
+	err = srcClient.Get(context.TODO(), client.ObjectKey{Namespace: srcNamespace, Name: srcPVC}, pvc)
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		log.Fatal(err, "unable to get source PVC")
 	}
 
-	err = state_transfer.QuiesceApplications(srccfg, ns)
+	destPVC := pvc.DeepCopy()
+
+	destPVC.ResourceVersion = ""
+	destPVC.Spec.VolumeName = ""
+	pvc.Annotations = map[string]string{}
+	err = destClient.Create(context.TODO(), destPVC, &client.CreateOptions{})
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		log.Fatal(err, "unable to create destination PVC")
 	}
 
-	nsPVCList := v1.PersistentVolumeClaimList{}
-
-	err = c.List(context.TODO(), &nsPVCList, &client.ListOptions{Namespace: ns})
+	pvcList, err := transfer.NewPVCPairList(
+		transfer.NewPVCPair(pvc, destPVC),
+	)
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		log.Fatal(err, "invalid pvc list")
 	}
 
-	for _, pvc := range nsPVCList.Items {
-		pvc.ResourceVersion = ""
-		pvc.Spec.VolumeName = ""
-		pvc.Annotations = map[string]string{}
-		err = dc.Create(context.TODO(), &pvc, &client.CreateOptions{})
+	endpointPort := int32(2222)
+	// create a route for data transfer
+	r := route.NewEndpoint(
+		types.NamespacedName{
+			Namespace: pvc.Namespace,
+			Name:      pvc.Name,
+		}, endpointPort, route.EndpointTypePassthrough, labels.Labels)
+	e, err := endpoint.Create(r, destClient)
+	if err != nil {
+		log.Fatal(err, "unable to create route endpoint")
+	}
+
+	_ = wait.PollUntil(time.Second*5, func() (done bool, err error) {
+		ready, err := e.IsHealthy(destClient)
 		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
+			log.Println(err, "unable to check route health, retrying...")
+			return false, nil
 		}
+		return ready, nil
+	}, make(<-chan struct{}))
+
+	// create an stunnel transport to carry the data over the route
+	proxyOptions := transport.ProxyOptions{
+		URL:      "127.0.0.1",
+		Username: "foo",
+		Password: "bar",
+	}
+	s := stunnel.NewTransport(&proxyOptions)
+	_, err = transport.CreateServer(s, srcClient, e)
+	if err != nil {
+		log.Fatal(err, "error creating stunnel client")
 	}
 
-	for _, pvc := range nsPVCList.Items {
-		var transfer state_transfer.Transfer
+	//_, err = transport.CreateClient(s, destClient, e)
+	//if err != nil {
+	//	log.Fatal(err, "error creating stunnel server")
+	//}
 
-		transfer = state_transfer.CreateRcloneTransfer()
-		//transfer = state_transfer.CreateRsyncTransfer()
-
-		transfer.SetTransport(&state_transfer.StunnelTransport{})
-		//transfer.SetTransport(&state_transfer.NullTransport{})
-
-		transfer.SetEndpoint(&state_transfer.RouteEndpoint{})
-		//transfer.SetEndpoint(&state_transfer.LoadBalancerEndpoint{})
-
-		transfer.SetSource(srccfg)
-		transfer.SetDestination(dstcfg)
-		transfer.SetPVC(pvc)
-		err := state_transfer.CreateServer(transfer)
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
-		err = state_transfer.CreateClient(transfer)
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
+	// Create Rclone Transfer Pod
+	t, err := rclone.NewTransfer(s, r, srcCfg, destCfg, pvcList)
+	if err != nil {
+		log.Fatal(err, "errror creating rclone transfer")
 	}
+
+	err = transfer.CreateServer(t)
+	if err != nil {
+		log.Fatal(err, "error creating rclone server")
+	}
+
+	// Create Rclone Client Pod
+	err = transfer.CreateClient(t)
+	if err != nil {
+		log.Fatal(err, "error creating rclone client")
+	}
+
+	// TODO: check if the client is completed
 }
